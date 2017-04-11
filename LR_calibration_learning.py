@@ -58,13 +58,9 @@ def data_prepare(datapath, schema):
 
     return f
 
-def split(data, undersample, fraction):
+def split(data, fraction):
 
-    if undersample == 'underSample':
-        win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=fraction)
-    else:
-        win_sample = data.where(data['event'] == 0)
-
+    win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=fraction)
     click_sample = data.where(data['event'] == 1)
 
     f = win_sample.unionAll(click_sample)
@@ -353,7 +349,7 @@ if __name__ == '__main__':
     #f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-0000{0,1,2,3,4,5}', schema)
     f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-00000', schema)
     #f = data_prepare('s3://pocketmath-tiny/data/from_hermes_raw/2017/04/02/20/part-00*', schema)
-    train, test = split(f, undersample='underSample', fraction=0.1)
+    train, test = split(f, fraction=0.1)
     #Model = model_prepare(train, mode='toCrossValidate')
     Model = model_prepare(train, mode='notToCrossValidate')
     transformed, roc_auc, logloss = test_model(Model, test)

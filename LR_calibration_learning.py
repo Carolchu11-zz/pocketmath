@@ -45,7 +45,7 @@ def data_prepare(datapath, schema):
     uf = UserDefinedFunction(lambda x: replace(x), IntegerType())
     f = f.select(*[uf(column).alias('event') if column == 'event' else column for column in f.columns])
 
-    # Subtract sublist of column 'order_iab-cat'
+    # Subtract sublist of column 'order_iab-cat', for example: IAB1-14 --> IAB1
     uf1 = UserDefinedFunction(lambda x: unique(x), ArrayType(StringType()))
     f = f.select(*[uf1(column).alias('order_iab_cat') if column == 'order_iab_cat' else column for column in f.columns])
 
@@ -58,10 +58,13 @@ def data_prepare(datapath, schema):
 
     return f
 
-def split(data):
+def split(data, undersample, fraction):
 
-    win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=0.1)
-    #win_sample = data.where(data['event'] == 0)
+    if undersample == 'underSample':
+        win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=fraction)
+    else:
+        win_sample = data.where(data['event'] == 0)
+
     click_sample = data.where(data['event'] == 1)
 
     f = win_sample.unionAll(click_sample)
@@ -123,7 +126,9 @@ def model_prepare(train, mode):
 
     # Logistic regression with no calibration
     if mode == 'toCrossValidate':
+
         lr = LogisticRegression()
+
         print ('Begin fitting cross validate logistic regression model')
         start_time0 = datetime.now()
         # Cross Validation and return cvModel
@@ -134,15 +139,20 @@ def model_prepare(train, mode):
         end_time0 = datetime.now()
         print ('Finish fitting cross validate logistic regression model')
         print ('Duration of training cross validate logistic regression model: {}'.format(end_time0 - start_time0))
+
         return cvModel
+
     else:
+
         lr = LogisticRegression()
+
         print ('Begin fitting logistic regression model')
         start_time0 = datetime.now()
         lrModel = lr.fit(train)
         end_time0 = datetime.now()
         print ('Finish fitting logistic regression model')
         print ('Duration of training logistic regression model: {}'.format(end_time0 - start_time0))
+
         return lrModel
 
 def computeLogLoss(p, y):
@@ -175,82 +185,100 @@ def test_model(model, test):
     evaluator = BinaryClassificationEvaluator()
 
     # Compute ROC area under curve, and log loss before calibration
+
+    print ('Begin transforming test data for LR model')
+    start_time1 = datetime.now()
     transformed = model.transform(test)
+    print ('Finish transforming test data for LR model')
+    end_time1 = datetime.now()
+    print('Duration of transforming test data for LR model: {}'.format(end_time1 - start_time1))
+
     roc_auc = evaluator.evaluate(transformed, {evaluator.metricName: "areaUnderROC"})
 
-    logloss = transformed.select(['label', 'probability']).rdd.map(lambda row: computeLogLoss(row.probability[1], row.label)).mean()
+    logloss = transformed.select(['label', 'probability']).rdd.map(
+        lambda row: computeLogLoss(row.probability[1], row.label)).mean()
 
     return transformed, roc_auc, logloss
 
 # Training isotonic regression model by using logistic regression model and training set
-def calibration(model, transformed, train):
+def calibration(model, transformed, train, mode):
 
     # Apply trained logistic regression model in training set and get transform
     transformed_train = model.transform(train)
 
-    # Logistic regression with isotonic calibration
-    # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
-    uf = UserDefinedFunction(lambda x: Vectors.dense(x[1]), VectorUDT())
+    if mode == 'calibration':
 
-    df = transformed_train.selectExpr("label as label", "probability as features")
-    df = df.select(*[uf(column).alias('features') if column == 'features' else column for column in df.columns])
-    lr_isotonic = IsotonicRegression()
-    model_isotonic = lr_isotonic.fit(df)
+        # Logistic regression with isotonic calibration
+        # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
+        uf = UserDefinedFunction(lambda x: Vectors.dense(x[1]), VectorUDT())
 
-    # Compute ROC area under curve and log loss after isotonic calibration
-    # Create training set for isotonic regression model by selecting probability as features
-    df1 = transformed.selectExpr("label as label", "probability as features")
-    df1 = df1.select(*[uf(column).alias('features') if column == 'features' else column for column in df1.columns])
-    transformed_isotonic = model_isotonic.transform(df1)
+        df = transformed_train.selectExpr("label as label", "probability as features")
+        df = df.select(*[uf(column).alias('features') if column == 'features' else column for column in df.columns])
 
-    predictionAndLabels = transformed_isotonic.rdd.map(lambda lp: (float(lp.prediction), float(lp.label)))
-    metrics = BinaryClassificationMetrics(predictionAndLabels)
-    roc_auc_isotonic = metrics.areaUnderROC
+        print ('Begin fitting train data for IS model')
+        start_time3 = datetime.now()
+        lr_isotonic = IsotonicRegression()
+        model_isotonic = lr_isotonic.fit(df)
+        print ('Finish fitting train data for IS model')
+        end_time3 = datetime.now()
+        print('Duration of fitting IS model: {}'.format(end_time3 - start_time3))
 
-    logloss_isotonic = transformed_isotonic.select(['label', 'prediction']).rdd.map(lambda row: computeLogLoss(row.prediction, row.label)).mean()
+        # Compute ROC area under curve and log loss after isotonic calibration
+        # Create training set for isotonic regression model by selecting probability as features
+        df1 = transformed.selectExpr("label as label", "probability as features")
+        df1 = df1.select(*[uf(column).alias('features') if column == 'features' else column for column in df1.columns])
+        transformed_isotonic = model_isotonic.transform(df1)
 
-    return transformed_isotonic, roc_auc_isotonic, logloss_isotonic
+        predictionAndLabels = transformed_isotonic.rdd.map(lambda lp: (float(lp.prediction), float(lp.label)))
+        metrics = BinaryClassificationMetrics(predictionAndLabels)
+        roc_auc_isotonic = metrics.areaUnderROC
 
-def group_calibration(model, transformed, train):
+        logloss_isotonic = transformed_isotonic.select(['label', 'prediction']).rdd.map(lambda row: computeLogLoss(row.prediction, row.label)).mean()
 
-    # Apply trained logistic regression model in training set and get transform
-    transformed_train = model.transform(train)
+        return transformed_isotonic, roc_auc_isotonic, logloss_isotonic
 
-    # Logistic regression with isotonic calibration
-    # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
-    uf = UserDefinedFunction(lambda x: round(x[1], 5), DoubleType())
-    uf1 = UserDefinedFunction(lambda x: Vectors.dense(x), VectorUDT())
+    else:
 
-    df = transformed_train.selectExpr("label as label", "probability as pred_CTR")
-    df = df.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df.columns])
-    df = df.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
-                                    (F.count("label") - F.sum("label")).alias("#impr"))
-    df = df.withColumn("real_CTR", df["#click"] / (df["#click"] + df["#impr"]))
-    df = df.selectExpr("real_CTR as label", "pred_CTR as features")
-    df = df.select(*[uf1(column).alias('features') if column == 'features' else column for column in df.columns])
+        # Logistic regression with isotonic calibration
+        # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
+        uf = UserDefinedFunction(lambda x: round(x[1], 5), DoubleType())
+        uf1 = UserDefinedFunction(lambda x: Vectors.dense(x), VectorUDT())
 
-    lr_isotonic = IsotonicRegression()
-    model_isotonic = lr_isotonic.fit(df)
+        df = transformed_train.selectExpr("label as label", "probability as pred_CTR")
+        df = df.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df.columns])
+        df = df.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
+                                        (F.count("label") - F.sum("label")).alias("#impr"))
+        df = df.withColumn("real_CTR", df["#click"] / (df["#click"] + df["#impr"]))
+        df = df.selectExpr("real_CTR as label", "pred_CTR as features")
+        df = df.select(*[uf1(column).alias('features') if column == 'features' else column for column in df.columns])
 
-    # Compute ROC area under curve and log loss after isotonic calibration
-    # Create training set for isotonic regression model by selecting probability as features
-    df1 = transformed.selectExpr("label as label", "probability as pred_CTR")
-    df1 = df1.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df1.columns])
-    df1 = df1.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
-                                    (F.count("label") - F.sum("label")).alias("#impr"))
-    df1 = df1.withColumn("real_CTR", df1["#click"] / (df1["#click"] + df1["#impr"]))
-    df1 = df1.selectExpr("real_CTR as label", "pred_CTR as features")
-    df1 = df1.select(*[uf1(column).alias('features') if column == 'features' else column for column in df1.columns])
+        print ('Begin fitting train data for IS model')
+        start_time3 = datetime.now()
+        lr_isotonic = IsotonicRegression()
+        model_isotonic = lr_isotonic.fit(df)
+        print ('Finish fitting train data for IS model')
+        end_time3 = datetime.now()
+        print('Duration of fitting IS model: {}'.format(end_time3 - start_time3))
 
-    transformed_isotonic = model_isotonic.transform(df1)
+        # Compute ROC area under curve and log loss after isotonic calibration
+        # Create training set for isotonic regression model by selecting probability as features
+        df1 = transformed.selectExpr("label as label", "probability as pred_CTR")
+        df1 = df1.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df1.columns])
+        df1 = df1.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
+                                        (F.count("label") - F.sum("label")).alias("#impr"))
+        df1 = df1.withColumn("real_CTR", df1["#click"] / (df1["#click"] + df1["#impr"]))
+        df1 = df1.selectExpr("real_CTR as label", "pred_CTR as features")
+        df1 = df1.select(*[uf1(column).alias('features') if column == 'features' else column for column in df1.columns])
 
-    predictionAndLabels = transformed_isotonic.rdd.map(lambda lp: (float(lp.prediction), float(lp.label)))
-    metrics = BinaryClassificationMetrics(predictionAndLabels)
-    roc_auc_isotonic = metrics.areaUnderROC
+        transformed_isotonic = model_isotonic.transform(df1)
 
-    logloss_isotonic = transformed_isotonic.select(['label', 'prediction']).rdd.map(lambda row: computeLogLoss(row.prediction, row.label)).mean()
+        predictionAndLabels = transformed_isotonic.rdd.map(lambda lp: (float(lp.prediction), float(lp.label)))
+        metrics = BinaryClassificationMetrics(predictionAndLabels)
+        roc_auc_isotonic = metrics.areaUnderROC
 
-    return transformed_isotonic, roc_auc_isotonic, logloss_isotonic
+        logloss_isotonic = transformed_isotonic.select(['label', 'prediction']).rdd.map(lambda row: computeLogLoss(row.prediction, row.label)).mean()
+
+        return transformed_isotonic, roc_auc_isotonic, logloss_isotonic
 
 def binScore(value):
 
@@ -284,16 +312,21 @@ def bucket(transformed):
 
     return predictionBins
 
-def bucket_isotonic(transformed):
+def bucket_isotonic(transformed, mode):
 
     uf = UserDefinedFunction(lambda x: binScore(x), IntegerType())
     df = transformed.select(*[uf(column).alias('prediction') if column == 'prediction' else column for column in transformed.columns])
     df = df.selectExpr("label as label", "prediction as pred_CTR")
-    #df = df.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
-    #                             (F.count("label") - F.sum("label")).alias("#impr"))
-    # Here, I use average prediction (probability of label 1) as real_CTR
-    predictionBins = df.groupBy("pred_CTR").agg(F.mean("label").alias("real_CTR"))
-    #predictionBins = df.withColumn("real_CTR", df["#click"] / (df["#click"] + df["#impr"]))
+
+    if mode == 'calibration':
+        df = df.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
+                                 (F.count("label") - F.sum("label")).alias("#impr"))
+        predictionBins = df.withColumn("real_CTR", df["#click"] / (df["#click"] + df["#impr"]))
+
+    else:
+        # Here, I use average prediction (probability of label 1) as real_CTR
+        predictionBins = df.groupBy("pred_CTR").agg(F.mean("label").alias("real_CTR"))
+
     uf1 = UserDefinedFunction(lambda x: int(x * 10000), IntegerType())
     predictionBins = predictionBins.select(
         *[uf1(column).alias('real_CTR') if column == 'real_CTR' else column for column in predictionBins.columns])
@@ -318,9 +351,9 @@ if __name__ == '__main__':
     ])
 
     #f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-0000{0,1,2,3,4,5}', schema)
-    #f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-00000', schema)
-    f = data_prepare('s3://pocketmath-tiny/data/from_hermes_raw/2017/04/02/20/part-00*', schema)
-    train, test = split(f)
+    f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-00000', schema)
+    #f = data_prepare('s3://pocketmath-tiny/data/from_hermes_raw/2017/04/02/20/part-00*', schema)
+    train, test = split(f, undersample='underSample', fraction=0.1)
     #Model = model_prepare(train, mode='toCrossValidate')
     Model = model_prepare(train, mode='notToCrossValidate')
     transformed, roc_auc, logloss = test_model(Model, test)
@@ -329,21 +362,13 @@ if __name__ == '__main__':
     print("ROC area before calibration: %f" % roc_auc)
     print("Log loss before calibration: %f" % logloss)
 
-# Show bucket probability before calibration
+    # Show bucket probability before calibration
     print ctr_pre.orderBy("pred_CTR").show(ctr_pre.count(), False)
 
-    #transformed_isotonic, roc_auc_isotonic, logloss_isotonic = calibration(cvModel, transformed, train)
-    #ctr_pre_isotonic = bucket_isotonic(transformed_isotonic)
-    #print("ROC area after calibration: %f" % roc_auc_isotonic)
-    #print("Log loss after calibration: %f" % logloss_isotonic)
-
-# Show bucket probability after calibration
-    #print ctr_pre_isotonic.orderBy("pred_CTR").show(ctr_pre_isotonic.count(), False)
-
-    transformed_isotonic, roc_auc_isotonic, logloss_isotonic = group_calibration(Model, transformed, train)
-    ctr_pre_isotonic = bucket_isotonic(transformed_isotonic)
+    transformed_isotonic, roc_auc_isotonic, logloss_isotonic = calibration(Model, transformed, train, mode='group_calibration')
+    ctr_pre_isotonic = bucket_isotonic(transformed_isotonic, mode='group_calibration')
     print("ROC area after calibration: %f" % roc_auc_isotonic)
     print("Log loss after calibration: %f" % logloss_isotonic)
 
-# Show bucket probability after calibration
+    # Show bucket probability after calibration
     print ctr_pre_isotonic.orderBy("pred_CTR").show(ctr_pre_isotonic.count(), False)

@@ -49,30 +49,14 @@ def data_prepare(datapath, schema):
     uf1 = UserDefinedFunction(lambda x: unique(x), ArrayType(StringType()))
     f = f.select(*[uf1(column).alias('order_iab_cat') if column == 'order_iab_cat' else column for column in f.columns])
 
-    # Use ChiSqSelector for selecting features
-    # selector = ChiSqSelector(numTopFeatures=20000, outputCol="selectedFeatures")
-    # f = selector.fit(f).transform(f)
-    # f = f.select(["label", "selectedFeatures"])
-
-    print ('Total lines of input data: {}'.format(f.count()))
-
-    return f
-
-def split(data, fraction):
-
-    win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=fraction)
-    click_sample = data.where(data['event'] == 1)
-
-    f = win_sample.unionAll(click_sample)
-
-    print ('Total lines of sample data: {}'.format(f.count()))
-
     # Convert column 'order_iab_cat' to one-hot encoding column
     a = f.select('order_iab_cat').distinct().rdd.map(lambda r: r[0]).collect()
     b = [item for sublist in a for item in sublist]
 
     order_iab_cats = list(set(b))
-    order_iab_cats_expr = [F.when(F.array_contains(F.col("order_iab_cat"), order_iab_cat), 1).otherwise(0).alias("e_" + order_iab_cat) for order_iab_cat in order_iab_cats]
+    order_iab_cats_expr = [
+        F.when(F.array_contains(F.col("order_iab_cat"), order_iab_cat), 1).otherwise(0).alias("e_" + order_iab_cat) for
+        order_iab_cat in order_iab_cats]
 
     f = f.select('event', 'io_id', 'creative_id', 'creative_version', 'exchange_id', 'app_bundle', 'norm_device_make',
                  'norm_device_model', 'norm_device_os', 'location_id', 'geo_country', *order_iab_cats_expr)
@@ -80,8 +64,10 @@ def split(data, fraction):
     # Convert all columns except 'order_iab_cat' to one-hot encoding column
     column_vec_in = ['io_id', 'creative_id', 'creative_version', 'exchange_id', 'app_bundle',
                      'norm_device_make', 'norm_device_model', 'norm_device_os', 'location_id', 'geo_country']
-    column_vec_out = ['io_id_catVec', 'creative_id_catVec', 'creative_version_catVec', 'exchange_id_catVec', 'app_bundle_catVec',
-                      'norm_device_make_catVec', 'norm_device_model_catVec', 'norm_device_os_catVec', 'location_id_catVec', 'geo_country_catVec']
+    column_vec_out = ['io_id_catVec', 'creative_id_catVec', 'creative_version_catVec', 'exchange_id_catVec',
+                      'app_bundle_catVec',
+                      'norm_device_make_catVec', 'norm_device_model_catVec', 'norm_device_os_catVec',
+                      'location_id_catVec', 'geo_country_catVec']
 
     indexers = [StringIndexer(inputCol=x, outputCol=x + '_tmp')
                 for x in column_vec_in]
@@ -94,29 +80,63 @@ def split(data, fraction):
 
     # Concatenate all feature columns into featuresCol(Vector)
     order_iab_cats_ = ['e_' + item for item in order_iab_cats]
-    vectorAsCols = ['io_id_catVec', 'creative_id_catVec', 'creative_version_catVec'] + order_iab_cats_ + ['exchange_id_catVec', 'app_bundle_catVec', 'norm_device_make_catVec',
-                    'norm_device_model_catVec', 'norm_device_os_catVec', 'location_id_catVec', 'geo_country_catVec']
+    vectorAsCols = ['io_id_catVec', 'creative_id_catVec', 'creative_version_catVec'] + order_iab_cats_ + [
+        'exchange_id_catVec', 'app_bundle_catVec', 'norm_device_make_catVec',
+        'norm_device_model_catVec', 'norm_device_os_catVec', 'location_id_catVec', 'geo_country_catVec']
     vectorAssembler = VectorAssembler(inputCols=vectorAsCols, outputCol="features")
     labelIndexer = StringIndexer(inputCol='event', outputCol="label")
     tmp += [vectorAssembler, labelIndexer]
     pipeline = Pipeline(stages=tmp)
 
     f = pipeline.fit(f).transform(f)
-    f.cache()
 
-    print ('Total columns of sample data: {}'.format(len(f.columns)))
+    # Use ChiSqSelector for selecting features
+    # selector = ChiSqSelector(numTopFeatures=20000, outputCol="selectedFeatures")
+    # f = selector.fit(f).transform(f)
+    # f = f.select(["label", "selectedFeatures"])
 
-    print ('Total dimensions of features: {}'.format(f.rdd.map(attrgetter("features")).first().size))
+    print ('Total lines of input data: {}'.format(f.count()))
 
-    win = f.where(f['label'] == 0)
-    click = f.where(f['label'] == 1)
+    win = f.where(f['event'] == 0)
+    click = f.where(f['event'] == 1)
 
-    # Split dataset into two part, training set for training model, validate set for training calibration model
-    train_win, test_win = win.randomSplit([4.0, 1.0], seed=None)
-    train_click, test_click = click.randomSplit([4.0, 1.0], seed=None)
-    train, test = train_win.unionAll(train_click), test_win.unionAll(test_click)
+    train_win, test_win = win.randomSplit([2.0, 1.0], seed=None)
+    train_click, test_click = click.randomSplit([2.0, 1.0], seed=None)
+    train_part, test_part = train_win.unionAll(train_click), test_win.unionAll(test_click)
 
-    return train, test
+    print ('Total lines of train_part:{}'.format(train_part.count()))  ### Error: memory limited
+    print ('Total lines of test_part:{}'.format(test_part.count()))
+
+    return train_part, test_part
+
+def split(data, fraction):
+
+    win = data.where(data['event'] == 0)
+    win_sample = data.where(data['event'] == 0).sample(withReplacement=False, fraction=fraction)
+    click = data.where(data['event'] == 1)
+
+    nb_win = win.count()
+    nb_win_sample = win_sample.count()
+    nb_click = click.count()
+
+    print ('Total lines of win:{}'.format(nb_win))
+    print ('Total lines of click:{}'.format(nb_click))
+
+    # Calculate the positive sample rate before sampling
+    rate_before = float(nb_click) / float(nb_win + nb_click)
+
+    # Calculate the positive sample rate after sampling
+    rate_after = float(nb_click) / float(nb_win_sample + nb_click)
+
+    train = win_sample.unionAll(click)
+
+    print ('Total lines of sample data of train_part: {}'.format(train.count()))
+
+    print ('Total columns of sample data of train_part: {}'.format(len(train.columns)))
+
+    print ('Total dimensions of features of train_part: {}'.format(train.rdd.map(attrgetter("features")).first().size))
+
+    return train, rate_before, rate_after
 
 def model_prepare(train, mode):
 
@@ -196,33 +216,43 @@ def test_model(model, test):
 
     return transformed, roc_auc, logloss
 
+# Prior correction for prediction after LR model
+def prior_correction(value, rate_before, rate_after):
+
+    return value/(value+(1-value)*(rate_after/rate_before))
+
 # Training isotonic regression model by using logistic regression model and training set
-def calibration(model, transformed, train, mode):
+def calibration(model, transformed, train, rate_before, rate_after, mode):
 
     # Apply trained logistic regression model in training set and get transform
     transformed_train = model.transform(train)
+
+    uf = UserDefinedFunction(lambda x: prior_correction(x[1], rate_before, rate_after), FloatType())
+    uf1 = UserDefinedFunction(lambda x: round(x, 5), DoubleType())
+    uf2 = UserDefinedFunction(lambda x: Vectors.dense(x), VectorUDT())
 
     if mode == 'calibration':
 
         # Logistic regression with isotonic calibration
         # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
-        uf = UserDefinedFunction(lambda x: Vectors.dense(x[1]), VectorUDT())
 
         df = transformed_train.selectExpr("label as label", "probability as features")
         df = df.select(*[uf(column).alias('features') if column == 'features' else column for column in df.columns])
+        df = df.select(*[uf2(column).alias('features') if column == 'features' else column for column in df.columns])
 
         print ('Begin fitting train data for IS model')
-        start_time3 = datetime.now()
+        start_time2 = datetime.now()
         lr_isotonic = IsotonicRegression()
         model_isotonic = lr_isotonic.fit(df)
         print ('Finish fitting train data for IS model')
-        end_time3 = datetime.now()
-        print('Duration of fitting IS model: {}'.format(end_time3 - start_time3))
+        end_time2 = datetime.now()
+        print('Duration of fitting IS model: {}'.format(end_time2 - start_time2))
 
         # Compute ROC area under curve and log loss after isotonic calibration
         # Create training set for isotonic regression model by selecting probability as features
         df1 = transformed.selectExpr("label as label", "probability as features")
         df1 = df1.select(*[uf(column).alias('features') if column == 'features' else column for column in df1.columns])
+        df1 = df1.select(*[uf2(column).alias('features') if column == 'features' else column for column in df1.columns])
         transformed_isotonic = model_isotonic.transform(df1)
 
         predictionAndLabels = transformed_isotonic.rdd.map(lambda lp: (float(lp.prediction), float(lp.label)))
@@ -237,34 +267,34 @@ def calibration(model, transformed, train, mode):
 
         # Logistic regression with isotonic calibration
         # Create dataframe by selecting label from transformed_train and and probability as features to train isotonic regression model
-        uf = UserDefinedFunction(lambda x: round(x[1], 5), DoubleType())
-        uf1 = UserDefinedFunction(lambda x: Vectors.dense(x), VectorUDT())
 
         df = transformed_train.selectExpr("label as label", "probability as pred_CTR")
         df = df.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df.columns])
+        df = df.select(*[uf1(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df.columns])
         df = df.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
                                         (F.count("label") - F.sum("label")).alias("#impr"))
         df = df.withColumn("real_CTR", df["#click"] / (df["#click"] + df["#impr"]))
         df = df.selectExpr("real_CTR as label", "pred_CTR as features")
-        df = df.select(*[uf1(column).alias('features') if column == 'features' else column for column in df.columns])
+        df = df.select(*[uf2(column).alias('features') if column == 'features' else column for column in df.columns])
 
         print ('Begin fitting train data for IS model')
-        start_time3 = datetime.now()
+        start_time2 = datetime.now()
         lr_isotonic = IsotonicRegression()
         model_isotonic = lr_isotonic.fit(df)
         print ('Finish fitting train data for IS model')
-        end_time3 = datetime.now()
-        print('Duration of fitting IS model: {}'.format(end_time3 - start_time3))
+        end_time2 = datetime.now()
+        print('Duration of fitting IS model: {}'.format(end_time2 - start_time2))
 
         # Compute ROC area under curve and log loss after isotonic calibration
         # Create training set for isotonic regression model by selecting probability as features
         df1 = transformed.selectExpr("label as label", "probability as pred_CTR")
         df1 = df1.select(*[uf(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df1.columns])
+        df1 = df1.select(*[uf1(column).alias('pred_CTR') if column == 'pred_CTR' else column for column in df1.columns])
         df1 = df1.groupBy("pred_CTR").agg(F.sum("label").alias("#click"),
                                         (F.count("label") - F.sum("label")).alias("#impr"))
         df1 = df1.withColumn("real_CTR", df1["#click"] / (df1["#click"] + df1["#impr"]))
         df1 = df1.selectExpr("real_CTR as label", "pred_CTR as features")
-        df1 = df1.select(*[uf1(column).alias('features') if column == 'features' else column for column in df1.columns])
+        df1 = df1.select(*[uf2(column).alias('features') if column == 'features' else column for column in df1.columns])
 
         transformed_isotonic = model_isotonic.transform(df1)
 
@@ -346,13 +376,13 @@ if __name__ == '__main__':
         StructField("geo_country", StringType()),
     ])
 
-    #f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-0000{0,1,2,3,4,5}', schema)
-    f = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-00000', schema)
-    #f = data_prepare('s3://pocketmath-tiny/data/from_hermes_raw/2017/04/02/20/part-00*', schema)
-    train, test = split(f, fraction=0.1)
+    #train_part, test_part = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-0000{0,1,2,3,4,5}', schema)
+    #train_part, test_part = data_prepare('/Users/carol/Documents/data/from_hermes_raw/part-00000', schema)
+    train_part, test_part = data_prepare('s3://pocketmath-tiny/data/from_hermes_raw/2017/04/02/20/part-000*', schema)
+    train, rate_before, rate_after = split(train_part, fraction=0.1)
     #Model = model_prepare(train, mode='toCrossValidate')
     Model = model_prepare(train, mode='notToCrossValidate')
-    transformed, roc_auc, logloss = test_model(Model, test)
+    transformed, roc_auc, logloss = test_model(Model, test_part)
     ctr_pre = bucket(transformed)
 
     print("ROC area before calibration: %f" % roc_auc)
@@ -361,7 +391,7 @@ if __name__ == '__main__':
     # Show bucket probability before calibration
     print ctr_pre.orderBy("pred_CTR").show(ctr_pre.count(), False)
 
-    transformed_isotonic, roc_auc_isotonic, logloss_isotonic = calibration(Model, transformed, train, mode='group_calibration')
+    transformed_isotonic, roc_auc_isotonic, logloss_isotonic = calibration(Model, transformed, train, rate_before, rate_after, mode='group_calibration')
     ctr_pre_isotonic = bucket_isotonic(transformed_isotonic, mode='group_calibration')
     print("ROC area after calibration: %f" % roc_auc_isotonic)
     print("Log loss after calibration: %f" % logloss_isotonic)
